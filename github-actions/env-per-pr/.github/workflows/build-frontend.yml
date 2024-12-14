@@ -1,0 +1,47 @@
+name: CI - Frontend
+# Here we declare the frontend CI workflow. This workflow is triggered by the following events:
+on:
+  workflow_call:
+    secrets:
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: true
+    inputs:
+      IMAGE_TAG:
+        description: 'Docker image tag'
+        required: true
+        type: string
+
+
+jobs:
+  # The build-and-release job is responsible for building and releasing the frontend code to the GitHub Container Registry.
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }} # configured on github repo
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }} # configured on github repo
+          aws-region: [REGION] # You can use the github variables/secrets to get the aws region from the repository or just hardcode it
+
+      - name: Login to AWS ECR
+        id: login-ecr
+        run: |
+          aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin [ACCOUNT].dkr.ecr.[REGION].amazonaws.com
+
+      - name: Build Docker image
+        run: |
+          docker build -t frontend:${{ inputs.IMAGE_TAG }} ./frontend
+
+      - name: Tag Docker image
+        run: |
+          docker tag frontend:${{ inputs.IMAGE_TAG }} [ACCOUNT].dkr.ecr.[REGION].amazonaws.com/[REPOSITORY]/frontend:${{ inputs.IMAGE_TAG }}
+
+      - name: Push Docker image to AWS ECR
+        run: |
+          docker push [ACCOUNT].dkr.ecr.[REGION].amazonaws.com/[REPOSITORY]/frontend:${{ inputs.IMAGE_TAG }}

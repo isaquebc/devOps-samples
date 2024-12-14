@@ -1,0 +1,382 @@
+name: New Env
+
+on:
+  pull_request:
+    branches: ["development"]
+    types: [ready_for_review]
+  workflow_dispatch:
+
+
+jobs:
+  # In this job we just add the label "Building..." to the PR
+  label-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove All Labels
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          REPO=${{ github.repository }}
+          curl -X DELETE \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels
+
+      - name: Add "Building..." label via GitHub API
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels \
+            -d '{"labels":["Building..."]}'
+
+  # In this job we run the CI for the frontend
+  build-frontend:
+    uses: ./.github/workflows/build-frontend.yml
+    secrets:
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }} # configured on github repo
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }} # configured on github repo
+    with:
+      IMAGE_TAG: "${{ github.event.pull_request.number }}"
+
+  # In this job we run the CI for the backend
+  build-backend:
+    uses: ./.github/workflows/build-backend.yml
+    secrets:
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}  # configured on github repo
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}  # configured on github repo
+    with:
+      IMAGE_TAG: "${{ github.event.pull_request.number }}"
+
+  # In this job we do the deploy of the new environment
+  cd-deploy:
+    runs-on: ubuntu-latest
+    needs: [build-frontend, build-backend]
+    steps:
+       # update current code base
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }} # configured on github repo
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }} # configured on github repo
+          aws-region: [REGION] # You can use the github variables/secrets to get the aws region from the repository or just hardcode it
+
+      # In this step we remove all labels from the PR 
+      - name: Remove All Labels
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          REPO=${{ github.repository }}
+          curl -X DELETE \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels
+
+      # In this step we add the label "Starting new instance..." to the PR
+      - name: Add "Starting new instance..." label via GitHub API
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels \
+            -d '{"labels":["Starting new instance..."]}'
+
+      # In this step we will start the EC2 instance
+      - name: Start ec2 instance
+        id: start_ec2
+        run: |
+          # Defining environment variables
+          AMI_ID=[AMI-ID]
+          INSTANCE_TYPE=[INSTANCE-TYPE] 
+          KEY_NAME=[GENERATED-KEY-NAME]
+          SECURITY_GROUP_ID=[SECURITY-GROUP-ID]
+          SUBNET_ID=[SUBNET-ID]
+          IAM_INSTANCE_PROFILE=[IAM-INSTANCE-PROFILE-ROLE]
+          INSTANCE_NAME="PR-${{ github.event.pull_request.number }}"
+          INSTANCE_DESCRIPTION="https://github.com/[GIT-ACCOUNT]/[GIT-REPO]/pull/${{ github.event.pull_request.number }}"
+
+          echo "* * * Starting EC2 instance with name $INSTANCE_NAME and description $INSTANCE_DESCRIPTION"
+
+          # Starting the EC2 instance and get the instance ID
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id $AMI_ID \
+            --count 1 \
+            --instance-type $INSTANCE_TYPE \
+            --key-name $KEY_NAME \
+            --security-group-ids $SECURITY_GROUP_ID \
+            --subnet-id $SUBNET_ID \
+            --associate-public-ip-address \
+            --iam-instance-profile Name=$IAM_INSTANCE_PROFILE \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME},{Key=Description,Value=$INSTANCE_DESCRIPTION}]" \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+
+          echo "* * * Waiting 'running' status on instance"
+          # Wait for the instance status to be running
+          aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+
+          
+          echo "* * * Geting the public IP of the instance"
+          
+          # Get the public IP of the instance
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids $INSTANCE_ID \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+
+          # Save variables to be used in the next steps
+          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "AMI_ID=$AMI_ID" >> $GITHUB_ENV
+          echo "KEY_NAME=$KEY_NAME" >> $GITHUB_ENV
+          echo "INSTANCE_NAME=$INSTANCE_NAME" >> $GITHUB_ENV
+          DOMAIN="pr${{ github.event.pull_request.number }}.YOUR.DOMAIN"
+          echo "$DOMAIN" > domain_file.txt
+          echo "DOMAIN=${DOMAIN}" >> $GITHUB_ENV
+
+      # In this step we remove all labels from the PR 
+      - name: Remove All Labels
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          REPO=${{ github.repository }}
+          curl -X DELETE \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels
+      
+      # In this step we add the label "Registering on route 53..." to the PR
+      - name: Add "Registering on route 53..." label via GitHub API
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels \
+            -d '{"labels":["Registering on route 53..."]}'
+
+      - name: Setup DNS Record on Route 53
+        run: |
+          # Get the domain from the file
+          DOMAIN=$(cat domain_file.txt)
+          
+          echo "DOMAIN = $DOMAIN" 
+          
+          # Define the domain for the PR
+          HOSTED_ZONE_ID=[HOSTED-ZONE-ID] # You can use the github variables/secrets to get the hosted zone id from the repository or just hardcode it
+
+          echo "* * * Creating the JSON file for DNS entries"
+
+          # Create the JSON file for DNS entries
+          echo '{"Comment": "Create A records for '$DOMAIN' and *.'$DOMAIN'","Changes": [{"Action": "UPSERT","ResourceRecordSet": {"Name": "'$DOMAIN'","Type": "A","TTL": 300,"ResourceRecords": [{  "Value": "'$PUBLIC_IP'"}]}},{"Action": "UPSERT","ResourceRecordSet": {"Name": "*.'$DOMAIN'","Type": "A","TTL": 300,"ResourceRecords": [{  "Value": "'$PUBLIC_IP'"}]}}]}' > dns-record.json
+          
+          # Read the JSON file just to log it
+          cat dns-record.json
+
+          echo "* * * Updating the DNS record in Route 53"
+
+          # Update the DNS record in Route 53 using created files
+          aws route53 change-resource-record-sets --hosted-zone-id $HOSTED_ZONE_ID --change-batch file://dns-record.json
+      
+      # In this step we remove all labels from the PR 
+      - name: Remove All Labels
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          REPO=${{ github.repository }}
+          curl -X DELETE \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels
+
+      # In this step we add the label "Deploying into new instance..." to the PR
+      - name: Add "Deploying into new instance..." label via GitHub API
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels \
+            -d '{"labels":["Deploying into new instance..."]}'
+
+      # In this step we access the instance to deploy on the created environment
+      - name: Access instance via SSH
+        env:
+          REF_NAME_SLUG: ${{ env.GT_GITHUB_REF_NAME_SLUG}}
+          SHA: ${{ env.GT_GITHUB_SHA_SHORT }}
+        run: |
+          DOMAIN=pr${{ github.event.pull_request.number }}.YOUR.DOMAIN # Here you need to replace YOUR.DOMAIN with your domain
+          echo "${{ secrets.AWS_PEM_FILE_CONTENT }}" > key.pem # You should have a ami configured with this pem file, and save it on github secrets
+          chmod 400 key.pem
+          
+          
+          echo "Wait for the instance to be ready using AWS CLI"
+          INSTANCE_STATUS=""
+          
+          # Wait for the instance to be ready
+          while [ "$INSTANCE_STATUS" != "running" ]; do
+            INSTANCE_STATUS=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].State.Name" --output text)
+            echo "Waiting for the instance to be ready... Current status: $INSTANCE_STATUS"
+            sleep 10
+          done
+    
+          printf "* * * Accessing the instance throgh SSH"
+          
+          # Runing script throgh SSH
+          # Here you need to replace YOUR.DOMAIN with your domain
+          ssh -o StrictHostKeyChecking=no -i "key.pem" ubuntu@pr${{ github.event.pull_request.number }}.YOUR.DOMAIN << 'ENDSSH' 
+          
+          # In my case, my ami is based on linux ubuntu, 
+          # so the path to the project is /home/ubuntu/[YOUR-PROJECT-FOLDER]
+          cd /home/ubuntu/[YOUR-PROJECT-FOLDER]
+
+          DOMAIN=pr${{ github.event.pull_request.number }}.YOUR.DOMAIN
+
+          echo "* * * $DOMAIN"
+          echo "* * * Going to the branch ${{ github.head_ref }} and pulling the latest changes"
+          BRANCH_NAME=${{ github.head_ref }}
+
+          # Updating the code base locally on instance
+          git fetch origin $BRANCH_NAME
+          git checkout $BRANCH_NAME
+          git reset --hard origin/$BRANCH_NAME
+
+          # Change instance name to PR number just to be easyer to identify where you are
+          sudo hostnamectl set-hostname PR-${{ github.event.pull_request.number }}
+
+          # Here you should to replace [ACCOUNT], [REGION] and [REPOSITORY] with your aws account number, region and repository
+          
+          # In my case, I'm using AWS ECR to store my docker images
+          DOCKER_REPO="[ACCOUNT].dkr.ecr.[REGION].amazonaws.com/[REPOSITORY]"
+          DEFAULT_DOMAIN="$DOMAIN"
+          REF_NAME="${{ env.GT_GITHUB_REF_NAME }}"
+
+          # The tag will ever be the PR number
+          DOCKER_IMAGE_TAG="${{ github.event.pull_request.number }}"
+
+          # In my case: I have a docker image for the database that is already populated
+          DB_IMAGE="[ACCOUNT].dkr.ecr.[REGION].amazonaws.com/[REPOSITORY]/db:latest"
+
+          echo "* * * Setting the WEBSITE_URL variable to '$DEFAULT_DOMAIN' in the backend"
+
+          # Here you can set any environment variable that you want 
+          # exp: I'm using django, and I need to set the WEBSITE_URL variable to run the backend
+          # Here you should replace [YOUR-PROJECT-FOLDER] with your project folder
+          echo "WEBSITE_URL='https://$DEFAULT_DOMAIN'" >> /home/ubuntu/[YOUR-PROJECT-FOLDER]/backend/backend/settings_local.py
+          
+          WILDCARD_DOMAIN="*.$DOMAIN"
+          echo "* * * Generating domain certificate to '$DEFAULT_DOMAIN' and '$WILDCARD_DOMAIN'  using [YOUR-EMAIL] to agree"
+
+          # Here we generate a certificate to have "HTTPS". You should to replace [YOUR-EMAIL] with your email
+          sudo certbot certonly --standalone -d $DOMAIN -d $WILDCARD_DOMAIN --non-interactive --agree-tos -m [YOUR-EMAIL]
+          
+          
+          echo "* * * Login into AWS ECR"
+          # Here we make login into AWS ECR to get the docker image
+          export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} && aws ecr get-login-password --region [REGION] | docker login --username AWS --password-stdin [ACCOUNT].dkr.ecr.[REGION].amazonaws.com/[REPOSITORY]
+
+          echo "* * * Starting deploy"
+
+          # In my case, my ami is based on linux ubuntu, 
+          # so the path to the project is /home/ubuntu/[YOUR-PROJECT-FOLDER]
+          cd /home/ubuntu/[YOUR-PROJECT-FOLDER]
+
+          # Here I export some environment variables to use in the deploy
+          # In my case, I'm using a Makefile to deploy the project, this is a personal choice
+          # In this case, I have a commando to deploy and run a script to populate the database
+          # with specific data to run end-to-end tests
+          export DOCKER_REPO=$DOCKER_REPO REF_NAME=$REF_NAME DOCKER_IMAGE_TAG=$DOCKER_IMAGE_TAG DEFAULT_DOMAIN=$DEFAULT_DOMAIN && make deploy_populate
+          
+          ENDSSH
+
+      # In this step we remove all labels from the PR 
+      - name: Remove All Labels
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          REPO=${{ github.repository }}
+          curl -X DELETE \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels
+
+      # In this step we add the label "ON-LINE" to the PR
+      - name: Add "ON-LINE" label via GitHub API
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels \
+            -d '{"labels":["ON-LINE"]}'
+
+      # In this step we add a comment on the PR with the instance details
+      - name: Adding comment on pr with instance details
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.payload.pull_request.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `
+                EC2 instance started successfully!:
+                - **ID**: ${process.env.INSTANCE_ID}
+                - **AMI**: ${process.env.AMI_ID}
+                - **.pem Name**: ${process.env.KEY_NAME}
+                - **Instance Name**: ${process.env.INSTANCE_NAME}
+                - **Public IP**: ${process.env.PUBLIC_IP}
+                - **SSH user**: ubuntu
+                - **url**: https://${process.env.DOMAIN}
+              `
+            })
+
+      # This step will run only if the previous steps fail
+      # adding lavel "ERROR to set new environment" on PR
+      - name: Add Label on Failure
+        if: failure()  # this will run only if the previous step fails
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Job fail! status: ${{ job.status }}"
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          REPO=${{ github.repository }}
+          LABEL="ERROR to set new environment"
+
+          curl -X DELETE \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels
+
+          # Chamada para adicionar o label ao PR
+          curl -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -d "{\"labels\":[\"$LABEL\"]}" \
+            https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels
+  
+  # This job will run only if the previous job fails
+  # killing the ec2 instance and cleaning the route 53
+  error-kill-instance:
+    needs: [cd-deploy]
+    uses: ./.github/workflows/kill-env-exp.yml
+    if: failure()  # this will run only if the previous step fails
+    secrets:
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+    with:
+      target_job: just-kill-all
+      
+  # This job will run my end-to-end tests
+  test-e2e-experimental:
+    permissions:
+        contents: read
+    uses: ./.github/workflows/test-e2e.yml
+    needs: [cd-deploy]
+    secrets:
+      DEFAULT_DOMAIN: pr${{ github.event.pull_request.number }}.YOUR.DOMAIN

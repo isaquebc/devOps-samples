@@ -1,0 +1,187 @@
+name: Kill Env
+
+on:
+  workflow_call:
+    secrets:
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: true
+    inputs:
+      target_job:
+        type: string
+        description: 'Specify which job to run: terminate_ec2 or clear_route_53'
+        required: true
+
+  pull_request:
+    branches: ["development"]
+    types: [closed, converted_to_draft]
+
+
+jobs:
+  # In this job we check if the EC2 instance exists, if it does we set the output execute to true
+  check-instance:
+    runs-on: ubuntu-latest
+    outputs:
+      execute: ${{ steps.check_ec2_instance.outputs.execute }}
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }} # We get the access key from the secrets (configured on github repo)
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }} # We get the access secret key from the secrets (configured on github repo)
+          aws-region: [REGION] # You can use the github variables/secrets to get the aws region from the repository or just hardcode it
+
+      - name: Check if EC2 instance exists
+        id: check_ec2_instance # The id is used to get the output of this step (should be the same of outputs key of this job)
+        run: |
+          # Here we declare the instance name based on the PR number
+          INSTANCE_NAME="PR-${{ github.event.pull_request.number }}-experimental"
+          
+          # Here we get the instance id based on the instance name
+          INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running" --query 'Reservations[*].Instances[*].InstanceId' --output text)
+
+          # If the instance exists we set the output execute to true
+          if [ -n "$INSTANCE_ID" ]; then
+            echo "::set-output name=execute::true"
+          else
+            echo "* * * Instance does not exist"
+            echo "::set-output name=execute::false"
+          fi
+
+  # In this job we remove all labels from the PR and add the "Terminating enviroment..." label
+  add-labels:
+    runs-on: ubuntu-latest
+    needs: [check-instance]
+    if: needs.check-instance.outputs.execute == 'true' && inputs.target_job != 'just-kill-all'
+    steps:
+      
+      - name: Remove All Labels
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get the PR number and the repository name
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          REPO=${{ github.repository }}
+          
+          # Do a curl request to remove all labels from the PR
+          curl -X DELETE \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels
+
+      - name: Add "Terminating enviroment..." label via GitHub API
+        run: |
+          # Do a curl request to add the "Terminating enviroment..." label to the PR
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels \
+            -d '{"labels":["Terminating enviroment...", "Cleaning route 53..."]}'
+
+  # In this job we terminate the EC2 instance
+  terminate-ec2:
+    runs-on: ubuntu-latest
+    needs: [check-instance]
+    # This job will run when the PR is closed or converted to draft or
+    # through the workflow_call only if the check-instance job returns true to execute
+    # if the check-instance job returns false to execute we just skip this job
+    # if this job is called through the workflow_call we need to specify the target_job input as "just-kill-all"
+    if: needs.check-instance.outputs.execute == 'true' && (inputs.target_job == 'just-kill-all' || github.event.action == 'converted_to_draft' || github.event.action == 'closed')
+    steps:
+      # update current code base
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }} # configured on github repo
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }} # configured on github repo
+          aws-region: [REGION] # You can use the github variables/secrets to get the aws region from the repository or just hardcode it
+
+      - name: Terminate EC2 Instance
+        run: |
+          # Here we declare the instance name based on the PR number
+          INSTANCE_NAME="PR-${{ github.event.pull_request.number }}-experimental"
+          # Here we get the instance id based on the instance name
+          INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running" --query 'Reservations[*].Instances[*].InstanceId' --output text)
+          
+          printf "* * * Terminating EC2 instance with name $INSTANCE_NAME"
+          
+          # Terminate the instance
+          aws ec2 terminate-instances --instance-ids $INSTANCE_ID
+
+  # In this job we clear the route 53 records
+  clear-route-53:
+    runs-on: ubuntu-latest
+    needs: [check-instance]
+    # This job will run when the PR is closed or converted to draft or
+    # through the workflow_call only if the check-instance job returns true to execute.
+    # if the check-instance job returns false, we just skip this job.
+    # if this job is called through the workflow_call we need to specify the target_job input as "just-kill-all".
+    if: needs.check-instance.outputs.execute == 'true' && (inputs.target_job == 'just-kill-all' || github.event.action == 'converted_to_draft' || github.event.action == 'closed')
+    steps:
+       # update current code base
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}  # configured on github repo
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}  # configured on github repo
+          aws-region: [REGION] # You can use the github variables/secrets to get the aws region from the repository or just hardcode it
+
+      - name: Delete Route 53 Records
+        run: |
+          HOSTED_ZONE_ID=[HOSTED-ZONE-ID] # You can use the github variables/secrets to get the hosted zone id from the repository or just hardcode it
+          DOMAIN="pr${{ github.event.pull_request.number }}.YOUR.DOMAIN" # Here you need to replace YOUR.DOMAIN with your domain
+
+          # Get the domain record
+          DOMAIN_RECORD=$(aws route53 list-resource-record-sets --hosted-zone-id $HOSTED_ZONE_ID --query "ResourceRecordSets[?Name == '$DOMAIN.']" --output json)
+
+          # Get the first 10 records
+          aws route53 list-resource-record-sets \
+            --hosted-zone-id $HOSTED_ZONE_ID \
+            --query "ResourceRecordSets[?Name == '$DOMAIN.']" \
+            --output json | head -n 11 | tail -n 10 > record.json
+
+          # Create the json file to delete the record
+          echo '{ "Changes": [ { "Action": "DELETE", "ResourceRecordSet":' `cat record.json` '}]}' > dns-record-delete.json
+
+          # Create the json file base to delete the wildcard record
+          perl -pi -e 's/(pr\d+\.YOUR\.DOMAIN)/*.$1/' record.json  # Here you need to replace YOUR and DOMAIN with your domain ('s/(pr\d+\.example\.com)/*.$1/')
+
+          # Create the json file to delete the wildcard record
+          echo '{ "Changes": [ { "Action": "DELETE", "ResourceRecordSet":' `cat record.json` '}]}' > dns-wildcard-delete.json
+          if [ "$DOMAIN_RECORD" != "[]" ]; then
+            aws route53 change-resource-record-sets --hosted-zone-id $HOSTED_ZONE_ID --change-batch file://dns-record-delete.json
+            aws route53 change-resource-record-sets --hosted-zone-id $HOSTED_ZONE_ID --change-batch file://dns-wildcard-delete.json
+          fi
+
+  # In this job we remove all labels from the PR and add the "OFF" label
+  toggle-OFF-label:
+    runs-on: ubuntu-latest
+    needs: [clear-route-53, terminate-ec2]
+    # This job will run when the PR is closed or converted to draft only, if the target_job is "just-kill-all" it will be skipped
+    if: inputs.target_job != 'just-kill-all'
+    steps:
+      - name: Remove All Labels
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          REPO=${{ github.repository }}
+          curl -X DELETE \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels
+
+      - name: Add "OFF" label via GitHub API
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels \
+            -d '{"labels":["OFF"]}'
